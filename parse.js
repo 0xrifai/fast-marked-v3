@@ -181,8 +181,6 @@ const RE_START_A = /^<a /i;
 const RE_END_A = /^<\/a>/i;
 // Fast path: if none of these appear, the inline string is plain text.
 const RE_INLINE_TRIGGER = /[\\<\[`*!_~@]| {2,}\n|www\.|https?|ftp|mailto:|xmpp:/i;
-// Finds the next position where a text run must stop (used by scanText).
-const RE_STOP = /[\\<\[`*!_~@]| {2,}\n|www\.|[hH][tT][tT][pP][sS]?|[fF][tT][pP]|mailto:|xmpp:/g;
 // First non-whitespace at/after lastIndex (scanText's hard-break (?!\s*$) check).
 const RE_NON_WS_G = /\S/g;
 
@@ -484,6 +482,17 @@ function tryUrl(s, pos, ctx, plain) {
 
 /* ---------------- text-run scanner ---------------- */
 
+// Kind table for scanText: 0 ordinary, 1 simple stop (\ < [ ` * _ ~),
+// 2 '!' (stop only before '['), 3 space (hard-break run), 4 '@' (email),
+// 5 w/W (www.), 6 m/M/x/X (mailto:/xmpp:), 7 h/H (http/https), 8 f/F (ftp).
+const STOP_KIND = new Uint8Array(128);
+for (const c of [92, 60, 91, 96, 42, 95, 126]) STOP_KIND[c] = 1;
+STOP_KIND[33] = 2; STOP_KIND[32] = 3; STOP_KIND[64] = 4;
+STOP_KIND[119] = 5; STOP_KIND[87] = 5;
+STOP_KIND[109] = 6; STOP_KIND[77] = 6; STOP_KIND[120] = 6; STOP_KIND[88] = 6;
+STOP_KIND[104] = 7; STOP_KIND[72] = 7;
+STOP_KIND[102] = 8; STOP_KIND[70] = 8;
+
 // End index of the text run starting at i in s (first char always consumed).
 // A leading backtick run is consumed whole (marked's text token starts `+).
 // Hand-rolled char scan: the old RE_STOP exec per run was a hot spot.
@@ -498,51 +507,50 @@ function scanText(s, i) {
   }
   while (j < n) {
     const c = s.charCodeAt(j);
-    if (c === 92 || c === 60 || c === 91 || c === 96 || c === 42 || c === 95 || c === 126) return j;
-    if (c === 33) { // '!': stop only before '['
+    const k = c < 128 ? STOP_KIND[c] : 0;
+    if (k === 0) { j++; continue; }
+    if (k === 1) return j; // \ < [ ` * _ ~
+    if (k === 2) { // '!': stop only before '['
       if (s.charCodeAt(j + 1) === 91) return j;
       j++; continue;
     }
-    if (c === 32) { // space: hard break only if a run of >=2 spaces + \n + non-ws follows
+    if (k === 3) { // space: hard break only if a run of >=2 spaces + \n + non-ws follows
       if (s.charCodeAt(j - 1) === 32) { j++; continue; } // continuation of a run already evaluated
-      // j is the first space of the run (or the run started at i, where br already failed)
-      let k = j;
-      while (k < n && s.charCodeAt(k) === 32) k++;
-      if (j > i && k - j >= 2 && s.charCodeAt(k) === 10) {
-        RE_NON_WS_G.lastIndex = k + 1; // br's (?!\s*$): some non-ws must follow the \n
+      let kk = j;
+      while (kk < n && s.charCodeAt(kk) === 32) kk++;
+      if (j > i && kk - j >= 2 && s.charCodeAt(kk) === 10) {
+        RE_NON_WS_G.lastIndex = kk + 1; // br's (?!\s*$): some non-ws must follow the \n
         if (RE_NON_WS_G.exec(s)) return j;
       }
       j++; continue;
     }
-    if (c === 64) { // '@': backpedal to the email local-part start
+    if (k === 4) { // '@': backpedal to the email local-part start
       let r = j - 1;
       while (r >= 0 && isEmailLocalCode(s.charCodeAt(r))) r--;
       r++;
       return r > i ? r : i + 1;
     }
-    if (c === 119 || c === 87) { // w/W: www.
+    if (k === 5) { // w/W: www.
       if (s.charCodeAt(j + 1) === 119 && s.charCodeAt(j + 2) === 119 && s.charCodeAt(j + 3) === 46) {
         const pc = s.charCodeAt(j - 1);
         if (pc === 32 || pc === 9 || pc === 10 || pc === 13 || pc === 42 || pc === 95 || pc === 126 || pc === 40) return j;
       }
       j++; continue;
     }
-    if (c === 109 || c === 77 || c === 120 || c === 88) { // m/M/x/X: mailto:/xmpp:
+    if (k === 6) { // m/M/x/X: mailto:/xmpp:
       if (s.startsWith('mailto:', j) || s.startsWith('xmpp:', j)) {
         if (!isAlnumCode(s.charCodeAt(j - 1))) return j;
       }
       j++; continue;
     }
-    if (c === 104 || c === 72) { // h/H: http/https
+    if (k === 7) { // h/H: http/https
       const c1 = s.charCodeAt(j + 1), c2 = s.charCodeAt(j + 2), c3 = s.charCodeAt(j + 3);
       if ((c1 === 116 || c1 === 84) && (c2 === 116 || c2 === 84) && (c3 === 112 || c3 === 80)) return j;
       j++; continue;
     }
-    if (c === 102 || c === 70) { // f/F: ftp
-      const c1 = s.charCodeAt(j + 1), c2 = s.charCodeAt(j + 2);
-      if ((c1 === 116 || c1 === 84) && (c2 === 112 || c2 === 80)) return j;
-      j++; continue;
-    }
+    // k === 8: f/F: ftp
+    const c1 = s.charCodeAt(j + 1), c2 = s.charCodeAt(j + 2);
+    if ((c1 === 116 || c1 === 84) && (c2 === 112 || c2 === 80)) return j;
     j++;
   }
   return n;
