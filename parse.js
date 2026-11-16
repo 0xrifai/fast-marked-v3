@@ -453,9 +453,14 @@ function tryUrl(rem, ctx, plain) {
 /* ---------------- text-run scanner ---------------- */
 
 // End index of the text run starting at i in s (first char always consumed).
+// A leading backtick run is consumed whole (marked's text token starts `+).
 function scanText(s, i) {
   const n = s.length;
-  RE_STOP.lastIndex = i + 1;
+  let start = i + 1;
+  if (s.charCodeAt(i) === 96) {
+    while (start < n && s.charCodeAt(start) === 96) start++;
+  }
+  RE_STOP.lastIndex = start;
   let m;
   while ((m = RE_STOP.exec(s)) !== null) {
     const k = m.index, c = m[0];
@@ -579,4 +584,481 @@ function inlineParse(s, ctx, plain) {
     ctx.st.linkParenPossible = savedParen;
   }
   return out;
+}
+
+
+/* ---------------- block parser ---------------- */
+
+// Table cell splitter (marked's de()).
+function splitTableRow(a, limit) {
+  const t = a.replace(/\|/g, (m, o, str) => {
+    let odd = false, p = o;
+    while (--p >= 0 && str.charCodeAt(p) === 92) odd = !odd;
+    return odd ? '|' : ' |';
+  });
+  const n = t.split(' |');
+  if (!n[0].trim()) n.shift();
+  if (n.length > 0 && !n[n.length - 1].trim()) n.pop();
+  if (limit !== undefined) {
+    if (n.length > limit) n.length = limit;
+    else while (n.length < limit) n.push('');
+  }
+  for (let s = 0; s < n.length; s++) n[s] = n[s].trim().replace(/\\\|/g, '|');
+  return n;
+}
+
+// Trim trailing characters equal to the given char code.
+function trimEndCh(s, ch) {
+  let n = s.length;
+  while (n > 0 && s.charCodeAt(n - 1) === ch) n--;
+  return s.slice(0, n);
+}
+
+const RE_BEGIN_SPACE = /^\s+/;
+
+// Fenced-code indent compensation (marked's Dt()).
+function fenceDedent(full, content) {
+  const m = RE_INDENT_CODE_COMP.exec(full);
+  if (!m) return content;
+  const ind = m[1].length;
+  return content.split('\n').map(line => {
+    const o = RE_BEGIN_SPACE.exec(line);
+    if (!o) return line;
+    return line.slice(Math.min(o[0].length, ind));
+  }).join('\n');
+}
+
+// Cached per-indent block-start regexes. Marked's D() memoiser clamps the
+// indent to n = max(0, min(3, R-1)): a marker at exactly the content indent
+// is a nested construct (continuation), not a sibling break.
+const _atCache = new Map();
+function atRegexes(R) {
+  const n = Math.max(0, Math.min(3, R - 1));
+  let v = _atCache.get(n);
+  if (!v) {
+    v = { next: RE_NEXT_BULLET(n), hr: RE_HR_AT(n), fences: RE_FENCES_AT(n), heading: RE_HEADING_AT(n), html: RE_HTML_AT(n), bq: RE_BQ_AT(n) };
+    _atCache.set(n, v);
+  }
+  return v;
+}
+
+function parseList(e, ctx) {
+  const t = RE_LIST.exec(e);
+  if (!t) return null;
+  const n = e;
+  let rest = e;
+  const r = t[1].trim();
+  const ordered = r.length > 1;
+  const marker = ordered ? `\\d{1,9}\\${r.slice(-1)}` : `\\${r}`;
+  const itemRe = RE_LIST_ITEM(marker);
+  const list = { k: 'list', ordered, start: ordered ? +r.slice(0, -1) : 0, loose: false, items: [], raw: '' };
+  let p = false;
+  while (rest.length > 0) {
+    let u = false, d = '';
+    const it = itemRe.exec(rest);
+    if (!it || RE_HR.test(rest)) break;
+    const k = n.length - rest.length;
+    rest = rest.slice(it[0].length);
+    const g = it[2].split('\n', 1)[0];
+    const b = it[1].length;
+    let m = g.replace(RE_LEADING_SPACE_TAB, v => expandTabs(v, b));
+    let f = rest.split('\n', 1)[0];
+    let y = !m.trim();
+    let R = 0;
+    if (y) R = b + 1;
+    else {
+      R = m.search(RE_NON_SPACE);
+      if (R > 4) R = 1;
+      d = m.slice(R);
+      R += b;
+    }
+    if (y && RE_BLANK_LINE.test(f)) {
+      rest = rest.slice(f.length + 1);
+      u = true;
+    }
+    if (!u) {
+      const at = atRegexes(R);
+      while (rest.length > 0) {
+        const U = rest.split('\n', 1)[0];
+        f = U;
+        const Z = f.replace(RE_LEADING_SPACE_TAB, me => expandTabs(me, 0));
+        if (at.fences.test(f) || at.heading.test(f) || at.html.test(f) || at.bq.test(f) || at.next.test(f) || at.hr.test(f)) break;
+        if (Z.search(RE_NON_SPACE) >= R || !f.trim()) d += '\n' + Z.slice(R);
+        else {
+          if (y || m.replace(/\t/g, '    ').search(RE_NON_SPACE) >= 4 || at.fences.test(m) || at.heading.test(m) || at.html.test(m) || at.hr.test(m)) break;
+          const qe = RE_SETEXT_LINE.test(f) && RE_LHEADING.test(m + '\n' + f) ? '    ' + Z.replace(/^ {0,3}/, '') : f;
+          d += '\n' + qe;
+        }
+        y = !f.trim();
+        rest = rest.slice(U.length + 1);
+        m = Z.slice(R);
+      }
+    }
+    const A = n.slice(k, n.length - rest.length);
+    if (!list.loose) {
+      if (p) list.loose = true;
+      else if (RE_DOUBLE_BLANK.test(A)) p = true;
+    }
+    list.items.push({ raw: A, task: RE_LIST_IS_TASK.test(d), text: d, nodes: null, checkbox: undefined });
+  }
+  const last = list.items[list.items.length - 1];
+  if (!last) return null;
+  last.raw = last.raw.trimEnd();
+  last.text = last.text.trimEnd();
+  list.raw = n.slice(0, n.length - rest.length).trimEnd();
+  for (const item of list.items) {
+    const sub = parseBlocks(item.text, false, ctx);
+    item.nodes = sub.nodes;
+    if (!list.loose && sub.blankRun) list.loose = true;
+  }
+  if (list.loose) {
+    for (const item of list.items) {
+      item.loose = true;
+      for (const nd of item.nodes) if (nd.k === 'x') nd.k = 'p';
+    }
+  }
+  for (const item of list.items) {
+    if (!item.task) continue;
+    const first = item.nodes[0];
+    if (!first || (first.k !== 'x' && first.k !== 'p')) { item.task = false; continue; }
+    item.text = item.text.replace(RE_LIST_REPLACE_TASK, '');
+    first.t = first.t.replace(RE_LIST_REPLACE_TASK, '');
+    const ck = RE_LIST_TASK_CHECKBOX.exec(item.raw);
+    if (ck) item.checkbox = ck[0] !== '[ ]';
+  }
+  return { node: list, rawLen: list.raw.length };
+}
+
+function parseBlockquote(e, ctx) {
+  const t = RE_BLOCKQUOTE.exec(e);
+  if (!t) return null;
+  let lines = trimEndNL(t[0]).split('\n');
+  let s = '', r = '';
+  const nodes = [];
+  while (lines.length > 0) {
+    let started = false;
+    const chunk = [];
+    let p = 0;
+    for (; p < lines.length; p++) {
+      if (RE_BQ_START.test(lines[p])) { chunk.push(lines[p]); started = true; }
+      else if (!started) chunk.push(lines[p]);
+      else break;
+    }
+    lines = lines.slice(p);
+    const h = chunk.join('\n');
+    const u = h.replace(RE_BQ_MARKER_WS, (g, b, m) => b + expandTabs(m, b.length))
+               .replace(RE_BQ_SETEXT, '\n    $1')
+               .replace(RE_BQ_STRIP, '');
+    s = s ? s + '\n' + h : h;
+    r = r ? r + '\n' + u : u;
+    // Re-parse the chunk into the shared node list; the first paragraph of
+    // each chunk merges into a preceding paragraph (lazy continuation).
+    parseBlocks(u, true, ctx, true, nodes);
+    if (lines.length === 0) break;
+    const k = nodes[nodes.length - 1];
+    if (k && (k.k === 'code' || k.k === 'h' || k.k === 'hr' || k.k === 'html' || k.k === 'table')) break;
+    if (k && k.k === 'bq') {
+      const b = lines.join('\n');
+      const m2 = k.raw + '\n' + b.replace(RE_BQ_STRIP, '');
+      const f = parseBlockquote(m2, ctx);
+      if (!f) break;
+      nodes[nodes.length - 1] = f.node;
+      const y = m2.substring(f.rawLen).replace(/^\n/, '');
+      const R = y ? y.split('\n').length : 0;
+      const A = R ? lines.slice(0, -R) : lines;
+      if (A.length > 0) s = s + '\n' + A.join('\n');
+      r = r.substring(0, r.length - k.text.length) + f.node.text;
+      lines = lines.slice(A.length);
+      if (lines.length > 0 && RE_BQ_START.test(lines[0])) continue;
+      break;
+    } else if (k && k.k === 'list') {
+      const b = k.raw + '\n' + lines.join('\n');
+      const m2 = parseList(b, ctx);
+      if (!m2) break;
+      nodes[nodes.length - 1] = m2.node;
+      const f = m2.rawLen > k.raw.length ? b.slice(k.raw.length + 1, m2.rawLen).split('\n').length : 0;
+      if (f > 0) {
+        const y = lines.slice(0, f).join('\n');
+        s = s + '\n' + y;
+        r = r + '\n' + y;
+      }
+      lines = lines.slice(f);
+      continue;
+    }
+  }
+  return { node: { k: 'bq', nodes, text: r, raw: s }, rawLen: s.length };
+}
+
+function parseTable(e, ctx) {
+  const t = RE_TABLE.exec(e);
+  if (!t || !RE_TABLE_DELIMITER.test(t[2])) return null;
+  const headerCells = splitTableRow(t[1]);
+  const delimCells = t[2].replace(RE_TABLE_ALIGN_CHARS, '').split('|');
+  if (headerCells.length !== delimCells.length) return null;
+  const aligns = delimCells.map(c => RE_TABLE_ALIGN_RIGHT.test(c) ? 'right' : RE_TABLE_ALIGN_CENTER.test(c) ? 'center' : RE_TABLE_ALIGN_LEFT.test(c) ? 'left' : null);
+  const rows = t[3] && t[3].trim() ? t[3].replace(RE_TABLE_ROW_BLANK, '').split('\n') : [];
+  const header = headerCells.map((c, i) => ({ text: c, align: aligns[i] }));
+  const body = rows.map(r => splitTableRow(r, headerCells.length).map((c, i) => ({ text: c, align: aligns[i] })));
+  return { node: { k: 'table', header, body }, rawLen: trimEndNL(t[0]).length };
+}
+
+// Block parser. top: paragraphs are real paragraphs (else text nodes).
+// mergePara: the first paragraph of this call merges into a preceding
+// paragraph (blockquote lazy continuation; consumed after the first one).
+// out: node list to append to (shared across blockquote chunks).
+// Returns { nodes, blankRun } where blankRun means a >=2-newline run was seen.
+function parseBlocks(src, top, ctx, mergePara, out) {
+  const nodes = out || [];
+  let rest = src;
+  let blankRun = false;
+  let blankGap = false; // a blank line (space token) has intervened since the last node
+  let merge = !!mergePara;
+  while (rest.length > 0) {
+    const sp = RE_NEWLINE.exec(rest);
+    if (sp) {
+      const first = sp[0].indexOf('\n');
+      if (first !== -1 && sp[0].indexOf('\n', first + 1) !== -1) blankRun = true;
+      if (sp[0].length > 1) blankGap = true;
+      rest = rest.slice(sp[0].length);
+      continue;
+    }
+    let c0 = rest.charCodeAt(0);
+    if (c0 === 32 || c0 === 9) {
+      let col = 0, i = 0;
+      while (i < rest.length) {
+        const c = rest.charCodeAt(i);
+        if (c === 32) { col++; i++; }
+        else if (c === 9) { col += 4 - (col % 4); i++; }
+        else break;
+      }
+      if (col >= 4) {
+        const cd = RE_CODE.exec(rest);
+        if (cd) {
+          const raw = trimHtmlBlock(cd[0]);
+          const codeText = raw.replace(RE_CODE_REMOVE_INDENT, '');
+          const prev = nodes[nodes.length - 1];
+          if (!blankGap && prev && (prev.k === 'p' || prev.k === 'x')) {
+            prev.t += '\n' + codeText; // indented code merges into a paragraph
+          } else {
+            nodes.push({ k: 'code', t: codeText, lang: '' });
+          }
+          blankGap = false;
+          rest = rest.slice(raw.length);
+          continue;
+        }
+      }
+      c0 = i < rest.length ? rest.charCodeAt(i) : -1;
+    }
+    let node = null, consumed = 0;
+    if (c0 === 96 || c0 === 126) { // ` ~
+      const f = RE_FENCES.exec(rest);
+      if (f) {
+        const info = f[2] ? f[2].trim().replace(RE_ANY_PUNCT, '$1') : '';
+        const lang = info ? info.match(/^\S*/)[0] : '';
+        node = { k: 'code', t: fenceDedent(f[0], f[3] || ''), lang };
+        consumed = f[0].length;
+      }
+    }
+    if (!node && c0 === 35) { // #
+      const h = RE_HEADING.exec(rest);
+      if (h) {
+        let txt = h[2].trim();
+        if (/#$/.test(txt)) {
+          const s = trimEndCh(txt, 35);
+          if (!s || /[ \t]$/.test(s)) txt = s.trim();
+        }
+        node = { k: 'h', d: h[1].length, t: txt };
+        consumed = trimEndNL(h[0]).length;
+      }
+    }
+    if (!node && c0 === 62) { // >
+      const b = parseBlockquote(rest, ctx);
+      if (b) { node = b.node; consumed = b.rawLen; }
+    }
+    if (!node && (c0 === 45 || c0 === 43 || c0 === 42 || c0 === 95)) { // - + * _
+      const hr = RE_HR.exec(rest);
+      if (hr) { node = { k: 'hr' }; consumed = trimEndNL(hr[0]).length; }
+      else {
+        const l = parseList(rest, ctx);
+        if (l) { node = l.node; consumed = l.rawLen; }
+      }
+    }
+    if (!node && c0 === 60) { // <
+      const h = RE_HTML.exec(rest);
+      if (h) {
+        const raw = trimHtmlBlock(h[0]);
+        node = { k: 'html', t: raw };
+        consumed = raw.length;
+      }
+    }
+    if (!node && c0 === 91) { // [
+      const d = RE_DEF.exec(rest);
+      if (d && (RE_START_ANGLE.test(d[2]) || parenBalance(d[2]) === -1)) {
+        const defRaw = trimEndNL(d[0]);
+        const prev = nodes[nodes.length - 1];
+        if (!blankGap && prev && (prev.k === 'p' || prev.k === 'x')) {
+          prev.t += '\n' + defRaw; // def merges into a directly-following paragraph
+        } else {
+          const tag = normLabel(d[1]);
+          if (!ctx.refs.has(tag)) {
+            const href = d[2] ? d[2].replace(RE_HREF_BRACKETS, '$1').replace(RE_ANY_PUNCT, '$1') : '';
+            const title = d[3] ? d[3].substring(1, d[3].length - 1).replace(RE_ANY_PUNCT, '$1') : d[3];
+            ctx.refs.set(tag, { href, title });
+          }
+          blankGap = true; // a registered def breaks the merge chain
+        }
+        rest = rest.slice(defRaw.length);
+        continue;
+      }
+    }
+    if (!node && c0 >= 48 && c0 <= 57) { // digit
+      const l = parseList(rest, ctx);
+      if (l) { node = l.node; consumed = l.rawLen; }
+    }
+    if (!node) {
+      const tb = parseTable(rest, ctx);
+      if (tb) { node = tb.node; consumed = tb.rawLen; }
+    }
+    if (!node) {
+      const lh = RE_LHEADING.exec(rest);
+      if (lh) {
+        node = { k: 'h', d: lh[2].charAt(0) === '=' ? 1 : 2, t: lh[1].trim() };
+        consumed = trimEndNL(lh[0]).length;
+      }
+    }
+    if (!node) {
+      if (top) {
+        const p = RE_PARAGRAPH.exec(rest);
+        if (p) {
+          let txt = p[1];
+          if (txt.charCodeAt(txt.length - 1) === 10) txt = txt.slice(0, -1);
+          const prev = nodes[nodes.length - 1];
+          if (merge && !blankGap && prev && prev.k === 'p') {
+            prev.t += '\n' + txt; // lazy continuation across blockquote chunks
+          } else {
+            nodes.push({ k: 'p', t: txt });
+          }
+          merge = false;
+          blankGap = false;
+          rest = rest.slice(p[0].length);
+          continue;
+        }
+      } else {
+        const tx = RE_TEXT.exec(rest);
+        if (tx) {
+          const prev = nodes[nodes.length - 1];
+          if (!blankGap && prev && prev.k === 'x') {
+            prev.t += '\n' + tx[0]; // consecutive text lines merge
+          } else {
+            nodes.push({ k: 'x', t: tx[0] });
+          }
+          blankGap = false;
+          rest = rest.slice(tx[0].length);
+          continue;
+        }
+      }
+    }
+    if (!node) { rest = rest.slice(1); continue; } // safety: never spin
+    nodes.push(node);
+    blankGap = false;
+    rest = rest.slice(consumed);
+  }
+  return { nodes, blankRun };
+}
+
+/* ---------------- renderer ---------------- */
+
+// Inline-parse one block's text. inRaw resets per block (marked's queue loop);
+// inLink / linkEmitted deliberately persist across blocks.
+function inlineStr(t, ctx) {
+  ctx.st.inRaw = false;
+  return inlineParse(t, ctx, false);
+}
+
+function checkboxHtml(checked) {
+  return '<input ' + (checked ? 'checked="" ' : '') + 'disabled="" type="checkbox"> ';
+}
+
+function renderNode(nd, ctx, checkbox) {
+  switch (nd.k) {
+    case 'p': return '<p>' + (checkbox || '') + inlineStr(nd.t, ctx) + '</p>\n';
+    case 'x': return inlineStr(nd.t, ctx);
+    case 'h': return '<h' + nd.d + '>' + inlineStr(nd.t, ctx) + '</h' + nd.d + '>\n';
+    case 'hr': return '<hr>\n';
+    case 'code': {
+      const r = nd.t ? nd.t.replace(/\n$/, '') + '\n' : '';
+      return nd.lang
+        ? '<pre><code class="language-' + esc(nd.lang) + '">' + escFull(r) + '</code></pre>\n'
+        : '<pre><code>' + escFull(r) + '</code></pre>\n';
+    }
+    case 'html': return nd.t;
+    case 'bq': return '<blockquote>\n' + renderBlocks(nd.nodes, ctx) + '</blockquote>\n';
+    case 'list': {
+      const tag = nd.ordered ? 'ol' : 'ul';
+      const start = nd.ordered && nd.start !== 1 ? ' start="' + nd.start + '"' : '';
+      let s = '<' + tag + start + '>\n';
+      for (const it of nd.items) s += renderListItem(it, ctx);
+      return s + '</' + tag + '>\n';
+    }
+    case 'table': {
+      let s = '<table>\n<thead>\n<tr>\n';
+      for (const c of nd.header) s += renderTableCell(c, true, ctx);
+      s += '</tr>\n</thead>\n';
+      if (nd.body.length > 0) {
+        s += '<tbody>';
+        for (const row of nd.body) {
+          s += '<tr>\n';
+          for (const c of row) s += renderTableCell(c, false, ctx);
+          s += '</tr>\n';
+        }
+        s += '</tbody>';
+      }
+      return s + '</table>\n';
+    }
+  }
+  return '';
+}
+
+function renderTableCell(c, isHeader, ctx) {
+  const tag = isHeader ? 'th' : 'td';
+  return (c.align ? '<' + tag + ' align="' + c.align + '">' : '<' + tag + '>') + inlineStr(c.text, ctx) + '</' + tag + '>\n';
+}
+
+function renderListItem(item, ctx) {
+  let s = '<li>';
+  const nodes = item.nodes;
+  if (item.checkbox !== undefined) {
+    const cb = checkboxHtml(item.checkbox);
+    if (item.loose && nodes.length > 0 && (nodes[0].k === 'p' || nodes[0].k === 'x')) {
+      // loose list: checkbox goes inside the first paragraph
+      s += renderNode(nodes[0], ctx, cb);
+      for (let j = 1; j < nodes.length; j++) s += renderNode(nodes[j], ctx);
+    } else if (item.loose) {
+      // loose list, first block is not a paragraph: checkbox gets its own paragraph
+      s += '<p>' + cb + '</p>\n';
+      for (const nd of nodes) s += renderNode(nd, ctx);
+    } else {
+      // tight list: checkbox is a standalone token before the content
+      s += cb;
+      for (const nd of nodes) s += renderNode(nd, ctx);
+    }
+  } else {
+    for (const nd of nodes) s += renderNode(nd, ctx);
+  }
+  return s + '</li>\n';
+}
+
+function renderBlocks(nodes, ctx) {
+  let out = '';
+  for (const nd of nodes) out += renderNode(nd, ctx);
+  return out;
+}
+
+/* ---------------- public entry point ---------------- */
+
+export function parse(markdown) {
+  const src = String(markdown).replace(/\r\n|\r/g, '\n');
+  const ctx = { refs: new Map(), st: { inLink: false, inRaw: false, linkEmitted: false, linkParenPossible: true } };
+  const { nodes } = parseBlocks(src, true, ctx);
+  return renderBlocks(nodes, ctx);
 }
