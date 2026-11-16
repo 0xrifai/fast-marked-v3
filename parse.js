@@ -150,6 +150,25 @@ const RE_I_DEL_L = /^~~?(?:((?!~)[\p{P}\p{S}])|[^\s~])/u;
 const RE_I_DEL_R = /^[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
 const RE_I_AUTOLINK = /^<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^\s\x00-\x1f<>]*|[a-zA-Z0-9.!#$%&'*+/=?_`{|}~-]+(@)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(?![-_]))>/;
 const RE_I_URL = /^(?:mailto:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])|xmpp:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?)|^((?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*|^[A-Za-z0-9._+-]+(@)[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
+
+// Sticky (y) twins of the per-position inline regexes: they match at lastIndex
+// on the original string, so the inline loop never slices s per iteration
+// (the old s.slice(i) per token was O(n^2) on long paragraphs). The leading ^
+// of each ^-anchored pattern is dropped; y already anchors at lastIndex.
+// stripAnchors only removes ^ at the pattern start or after a top-level |,
+// never the ^ of a negated [^...] class.
+const stripAnchors = (src) => src.replace(/(^|\|)\^/g, '$1');
+const RE_I_ESCAPE_Y = /\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])/y;
+const RE_I_TAG_Y = new RegExp(stripAnchors(RE_I_TAG.source), 'y');
+const RE_I_LINK_Y = new RegExp(stripAnchors(RE_I_LINK.source), 'y');
+const RE_I_REFLINK_Y = new RegExp(stripAnchors(RE_I_REFLINK.source), 'y');
+const RE_I_NOLINK_Y = new RegExp(stripAnchors(RE_I_NOLINK.source), 'y');
+const RE_I_EM_L_Y = new RegExp(stripAnchors(RE_I_EM_L.source), 'uy');
+const RE_I_CODE_Y = /(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/y;
+const RE_I_BR_Y = new RegExp(stripAnchors(RE_I_BR.source), 'y');
+const RE_I_AUTOLINK_Y = new RegExp(stripAnchors(RE_I_AUTOLINK.source), 'y');
+const RE_I_URL_Y = new RegExp(stripAnchors(RE_I_URL.source), 'y');
+const RE_I_DEL_L_Y = new RegExp(stripAnchors(RE_I_DEL_L.source), 'uy');
 const RE_I_BACKPEDAL = new RegExp("(?:[^?!.,:;*_'\"~()&]+|\\([^)]*\\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+", "");
 const RE_I_BLOCKSKIP = new RegExp("\\[(?:[^\\[\\]`]|(?<a>`+)[^`]+\\k<a>(?!`))*?\\]\\((?:\\\\[\\s\\S]|[^\\\\\\(\\)]|\\((?:\\\\[\\s\\S]|[^\\\\\\(\\)])*\\))*\\)|(?<!`)()(?<b>`+)[^`]+\\k<b>(?!`)|<(?! )[^<>]*?>", "g");
 const RE_I_REFLINK_SEARCH = /!?\[((?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?)\]\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})\]|!?\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})\](?:\[\])?(?!\()/g;
@@ -164,6 +183,8 @@ const RE_END_A = /^<\/a>/i;
 const RE_INLINE_TRIGGER = /[\\<\[`*!_~@]| {2,}\n|www\.|https?|ftp|mailto:|xmpp:/i;
 // Finds the next position where a text run must stop (used by scanText).
 const RE_STOP = /[\\<\[`*!_~@]| {2,}\n|www\.|[hH][tT][tT][pP][sS]?|[fF][tT][pP]|mailto:|xmpp:/g;
+// First non-whitespace at/after lastIndex (scanText's hard-break (?!\s*$) check).
+const RE_NON_WS_G = /\S/g;
 
 function isAlnumCode(c) {
   return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
@@ -245,8 +266,9 @@ function maskInline(s, refs) {
 
 /* ---------------- emphasis / strikethrough (marked's delimiter algorithm) ---------------- */
 
-function tryEmStrong(rem, masked, pos, closers, prevChar) {
-  const m = RE_I_EM_L.exec(rem);
+function tryEmStrong(s, masked, pos, closers, prevChar) {
+  RE_I_EM_L_Y.lastIndex = pos;
+  const m = RE_I_EM_L_Y.exec(s);
   if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return null;
   const r = m[0][0];
   const o = prevChar === r;
@@ -291,15 +313,16 @@ function tryEmStrong(rem, masked, pos, closers, prevChar) {
     if (mm > 0) continue;
     b = Math.min(b, b + mm + f);
     const te = [...s2[0]][0].length;
-    const M = rem.slice(0, k + s2.index + te + b);
+    const M = s.slice(pos, pos + k + s2.index + te + b);
     if (Math.min(k, b) % 2) return { raw: M, text: M.slice(1, -1), strong: false };
     return { raw: M, text: M.slice(2, -2), strong: true };
   }
   return null;
 }
 
-function tryDel(rem, masked, pos, closers, prevChar) {
-  const m = RE_I_DEL_L.exec(rem);
+function tryDel(s, masked, pos, closers, prevChar) {
+  RE_I_DEL_L_Y.lastIndex = pos;
+  const m = RE_I_DEL_L_Y.exec(s);
   if (!m) return null;
   const n = prevChar;
   if (!((m[1] || '') === '' || !n || RE_I_PUNCT.exec(n))) return null;
@@ -322,7 +345,7 @@ function tryDel(rem, masked, pos, closers, prevChar) {
     if (p > 0) continue;
     l = Math.min(l, l + p);
     const te = [...s2[0]][0].length;
-    const raw = rem.slice(0, o + s2.index + te + l);
+    const raw = s.slice(pos, pos + o + s2.index + te + l);
     return { raw, text: raw.slice(o, -o) };
   }
   return null;
@@ -392,13 +415,14 @@ function makeLink(labelRaw, isImg, href, title, raw, ctx, plain, autolink) {
   return { raw, out: o + '>' + inner + '</a>' };
 }
 
-function tryInlineLink(rem, full, pos, ctx, plain) {
+function tryInlineLink(s, pos, ctx, plain) {
   if (!ctx.st.linkParenPossible) return null;
-  const m = RE_I_LINK.exec(rem);
+  RE_I_LINK_Y.lastIndex = pos;
+  const m = RE_I_LINK_Y.exec(s);
   if (!m) return null;
   const isImg = m[0].charAt(0) === '!';
   const n = isImg ? 2 : 1;
-  if (labelHasTag(full.slice(pos), m[1], n)) return null;
+  if (labelHasTag(s.slice(pos), m[1], n)) return null;
   let dest = m[2].trim();
   let raw = m[0];
   let titlePart = m[3];
@@ -425,19 +449,21 @@ function tryInlineLink(rem, full, pos, ctx, plain) {
   return makeLink(m[1].replace(RE_OUTPUT_LINK_REPLACE, '$1'), isImg, href, title, raw, ctx, plain, false);
 }
 
-function tryRefLink(rem, full, pos, ctx, plain) {
-  const m = RE_I_REFLINK.exec(rem) || RE_I_NOLINK.exec(rem);
+function tryRefLink(s, pos, ctx, plain) {
+  RE_I_REFLINK_Y.lastIndex = pos;
+  const m = RE_I_REFLINK_Y.exec(s) || (RE_I_NOLINK_Y.lastIndex = pos, RE_I_NOLINK_Y.exec(s));
   if (!m) return null;
   const isImg = m[0].charAt(0) === '!';
   const n = isImg ? 2 : 1;
-  if (labelHasTag(full.slice(pos), m[1], n)) return null;
+  if (labelHasTag(s.slice(pos), m[1], n)) return null;
   const ref = ctx.refs.get(normLabel(m[2] || m[1]));
   if (!ref) return { raw: m[0].charAt(0), out: plain ? m[0].charAt(0) : m[0].charAt(0) };
   return makeLink(m[1].replace(RE_OUTPUT_LINK_REPLACE, '$1'), isImg, ref.href, ref.title, m[0], ctx, plain, false);
 }
 
-function tryUrl(rem, ctx, plain) {
-  const m = RE_I_URL.exec(rem);
+function tryUrl(s, pos, ctx, plain) {
+  RE_I_URL_Y.lastIndex = pos;
+  const m = RE_I_URL_Y.exec(s);
   if (!m) return null;
   let text, href;
   if (m[2] === '@') { text = m[0]; href = 'mailto:' + m[0]; }
@@ -454,48 +480,64 @@ function tryUrl(rem, ctx, plain) {
 
 // End index of the text run starting at i in s (first char always consumed).
 // A leading backtick run is consumed whole (marked's text token starts `+).
+// Hand-rolled char scan: the old RE_STOP exec per run was a hot spot.
+// Stops exactly where marked's inline text token stops: at \, <, [, `, *, _,
+// ~, at '!' before '[', at '  \n', at a valid www./scheme/mailto:/xmpp:
+// trigger, and at the start of an email local part before '@'.
 function scanText(s, i) {
   const n = s.length;
-  let start = i + 1;
-  if (s.charCodeAt(i) === 96) {
-    while (start < n && s.charCodeAt(start) === 96) start++;
+  let j = i + 1;
+  if (s.charCodeAt(i) === 96) { // backtick: consume the whole run
+    while (j < n && s.charCodeAt(j) === 96) j++;
   }
-  RE_STOP.lastIndex = start;
-  let m;
-  while ((m = RE_STOP.exec(s)) !== null) {
-    const k = m.index, c = m[0];
-    if (c.charCodeAt(0) === 32) return k; // '  \n' hard-break lead-in
-    if (c === '@') {
-      let r = k - 1;
+  while (j < n) {
+    const c = s.charCodeAt(j);
+    if (c === 92 || c === 60 || c === 91 || c === 96 || c === 42 || c === 95 || c === 126) return j;
+    if (c === 33) { // '!': stop only before '['
+      if (s.charCodeAt(j + 1) === 91) return j;
+      j++; continue;
+    }
+    if (c === 32) { // space: hard break only if a run of >=2 spaces + \n + non-ws follows
+      if (s.charCodeAt(j - 1) === 32) { j++; continue; } // continuation of a run already evaluated
+      // j is the first space of the run (or the run started at i, where br already failed)
+      let k = j;
+      while (k < n && s.charCodeAt(k) === 32) k++;
+      if (j > i && k - j >= 2 && s.charCodeAt(k) === 10) {
+        RE_NON_WS_G.lastIndex = k + 1; // br's (?!\s*$): some non-ws must follow the \n
+        if (RE_NON_WS_G.exec(s)) return j;
+      }
+      j++; continue;
+    }
+    if (c === 64) { // '@': backpedal to the email local-part start
+      let r = j - 1;
       while (r >= 0 && isEmailLocalCode(s.charCodeAt(r))) r--;
       r++;
       return r > i ? r : i + 1;
     }
-    if (c === 'www.') {
-      if (k > i) {
-        const pc = s.charCodeAt(k - 1);
-        if (pc === 32 || pc === 9 || pc === 10 || pc === 13 || pc === 42 || pc === 95 || pc === 126 || pc === 40) return k;
+    if (c === 119 || c === 87) { // w/W: www.
+      if (s.charCodeAt(j + 1) === 119 && s.charCodeAt(j + 2) === 119 && s.charCodeAt(j + 3) === 46) {
+        const pc = s.charCodeAt(j - 1);
+        if (pc === 32 || pc === 9 || pc === 10 || pc === 13 || pc === 42 || pc === 95 || pc === 126 || pc === 40) return j;
       }
-      RE_STOP.lastIndex = k + 1;
-      continue;
+      j++; continue;
     }
-    if (c === 'mailto:' || c === 'xmpp:') {
-      if (k > i && !isAlnumCode(s.charCodeAt(k - 1))) return k;
-      RE_STOP.lastIndex = k + 1;
-      continue;
+    if (c === 109 || c === 77 || c === 120 || c === 88) { // m/M/x/X: mailto:/xmpp:
+      if (s.startsWith('mailto:', j) || s.startsWith('xmpp:', j)) {
+        if (!isAlnumCode(s.charCodeAt(j - 1))) return j;
+      }
+      j++; continue;
     }
-    const lc = c.charCodeAt(0);
-    if (lc === 104 || lc === 72 || lc === 102 || lc === 70) { // h/H/f/F: http/https/ftp
-      if (k > i) return k;
-      RE_STOP.lastIndex = k + 1;
-      continue;
+    if (c === 104 || c === 72) { // h/H: http/https
+      const c1 = s.charCodeAt(j + 1), c2 = s.charCodeAt(j + 2), c3 = s.charCodeAt(j + 3);
+      if ((c1 === 116 || c1 === 84) && (c2 === 116 || c2 === 84) && (c3 === 112 || c3 === 80)) return j;
+      j++; continue;
     }
-    if (c === '!') {
-      if (s[k + 1] === '[') return k;
-      RE_STOP.lastIndex = k + 1;
-      continue;
+    if (c === 102 || c === 70) { // f/F: ftp
+      const c1 = s.charCodeAt(j + 1), c2 = s.charCodeAt(j + 2);
+      if ((c1 === 116 || c1 === 84) && (c2 === 112 || c2 === 80)) return j;
+      j++; continue;
     }
-    return k; // \, <, [, `, *, ~, _
+    j++;
   }
   return n;
 }
@@ -509,73 +551,102 @@ function inlineParse(s, ctx, plain) {
   if (!RE_INLINE_TRIGGER.test(s)) return plain ? unescapeNum(s) : esc(unescapeNum(s));
   const savedParen = ctx.st.linkParenPossible;
   ctx.st.linkParenPossible = savedParen && s.includes(')');
-  const masked = maskInline(s, ctx.refs);
-  const closers = lastClosers(masked);
+  // The masked copy and closer table only feed emphasis/del, so they are
+  // built only when the string can contain a delimiter (*, _ or ~).
+  const hasEm = s.indexOf('*') !== -1 || s.indexOf('_') !== -1 || s.indexOf('~') !== -1;
+  const masked = hasEm ? maskInline(s, ctx.refs) : s;
+  const closers = hasEm ? lastClosers(masked) : { star: -1, under: -1, tilde: -1 };
   const st = ctx.st;
   let out = '', i = 0, prevChar = '';
   try {
     while (i < s.length) {
-      const rem = s.slice(i);
+      const c = s.charCodeAt(i);
       let m, consumed = 0;
-      if ((m = RE_I_ESCAPE.exec(rem))) {
-        out += plain ? m[1] : esc(m[1]);
-        consumed = m[0].length;
-      } else if ((m = RE_I_TAG.exec(rem))) {
-        if (!st.inLink && RE_START_A.test(m[0])) st.inLink = true;
-        else if (st.inLink && RE_END_A.test(m[0])) st.inLink = false;
-        if (!st.inRaw && RE_START_PRE.test(m[0])) st.inRaw = true;
-        else if (st.inRaw && RE_END_PRE.test(m[0])) st.inRaw = false;
-        out += m[0];
-        consumed = m[0].length;
-      } else if ((m = tryInlineLink(rem, s, i, ctx, plain))) {
-        out += m.out;
-        consumed = m.raw.length;
-      } else if ((m = tryRefLink(rem, s, i, ctx, plain))) {
-        out += m.out;
-        consumed = m.raw.length;
-      } else {
-        const em = tryEmStrong(rem, masked, i, closers, prevChar);
-        if (em) {
-          const inner = inlineParse(em.text, ctx, plain);
-          out += plain ? inner : (em.strong ? '<strong>' + inner + '</strong>' : '<em>' + inner + '</em>');
-          consumed = em.raw.length;
-        } else if ((m = RE_I_CODE.exec(rem))) {
-          let code = m[2].replace(/\n/g, ' ');
-          if (/[^ ]/.test(code) && /^ /.test(code) && / $/.test(code)) code = code.substring(1, code.length - 1);
-          out += plain ? code : '<code>' + escFull(code) + '</code>';
-          consumed = m[0].length;
-        } else if ((m = RE_I_BR.exec(rem))) {
-          out += plain ? '' : '<br>';
+      if (c === 92) { // backslash: escape, else hard break
+        RE_I_ESCAPE_Y.lastIndex = i;
+        if ((m = RE_I_ESCAPE_Y.exec(s))) {
+          out += plain ? m[1] : esc(m[1]);
           consumed = m[0].length;
         } else {
-          const del = tryDel(rem, masked, i, closers, prevChar);
-          if (del) {
-            const inner = inlineParse(del.text, ctx, plain);
-            out += plain ? inner : '<del>' + inner + '</del>';
-            consumed = del.raw.length;
-          } else if ((m = RE_I_AUTOLINK.exec(rem))) {
+          RE_I_BR_Y.lastIndex = i;
+          if ((m = RE_I_BR_Y.exec(s))) {
+            out += plain ? '' : '<br>';
+            consumed = m[0].length;
+          }
+        }
+      } else if (c === 60) { // '<': raw html tag, else autolink
+        RE_I_TAG_Y.lastIndex = i;
+        if ((m = RE_I_TAG_Y.exec(s))) {
+          if (!st.inLink && RE_START_A.test(m[0])) st.inLink = true;
+          else if (st.inLink && RE_END_A.test(m[0])) st.inLink = false;
+          if (!st.inRaw && RE_START_PRE.test(m[0])) st.inRaw = true;
+          else if (st.inRaw && RE_END_PRE.test(m[0])) st.inRaw = false;
+          out += m[0];
+          consumed = m[0].length;
+        } else {
+          RE_I_AUTOLINK_Y.lastIndex = i;
+          if ((m = RE_I_AUTOLINK_Y.exec(s))) {
             const isEmail = m[2] === '@';
             const text = m[1], href = isEmail ? 'mailto:' + m[1] : m[1];
             const r = makeLink(text, false, href, '', m[0], ctx, plain, true);
             out += r.out;
             consumed = m[0].length;
-          } else if (!st.inLink && (m = tryUrl(rem, ctx, plain))) {
-            out += m.out;
-            consumed = m.raw.length;
-          } else {
-            // plain text run
-            const end = scanText(s, i);
-            const raw = s.slice(i, end);
-            if (st.inRaw) out += raw;
-            else if (plain) out += unescapeNum(raw);
-            else out += esc(unescapeNum(raw));
-            const lastCh = raw.charCodeAt(raw.length - 1);
-            if (lastCh !== 95) prevChar = raw.charAt(raw.length - 1); // not '_' -> update
-            consumed = end - i;
-            i += consumed;
-            continue;
           }
         }
+      } else if (c === 91 || c === 33) { // '[' or '!': inline link, then ref link
+        if ((m = tryInlineLink(s, i, ctx, plain))) {
+          out += m.out;
+          consumed = m.raw.length;
+        } else if ((m = tryRefLink(s, i, ctx, plain))) {
+          out += m.out;
+          consumed = m.raw.length;
+        }
+      } else if (c === 42 || c === 95) { // '*' '_': emphasis
+        const em = tryEmStrong(s, masked, i, closers, prevChar);
+        if (em) {
+          const inner = inlineParse(em.text, ctx, plain);
+          out += plain ? inner : (em.strong ? '<strong>' + inner + '</strong>' : '<em>' + inner + '</em>');
+          consumed = em.raw.length;
+        }
+      } else if (c === 96) { // '`': code span
+        RE_I_CODE_Y.lastIndex = i;
+        if ((m = RE_I_CODE_Y.exec(s))) {
+          let code = m[2].replace(/\n/g, ' ');
+          if (/[^ ]/.test(code) && /^ /.test(code) && / $/.test(code)) code = code.substring(1, code.length - 1);
+          out += plain ? code : '<code>' + escFull(code) + '</code>';
+          consumed = m[0].length;
+        }
+      } else if (c === 126) { // '~': strikethrough
+        const del = tryDel(s, masked, i, closers, prevChar);
+        if (del) {
+          const inner = inlineParse(del.text, ctx, plain);
+          out += plain ? inner : '<del>' + inner + '</del>';
+          consumed = del.raw.length;
+        }
+      } else if (c === 32) { // space: hard break
+        RE_I_BR_Y.lastIndex = i;
+        if ((m = RE_I_BR_Y.exec(s))) {
+          out += plain ? '' : '<br>';
+          consumed = m[0].length;
+        }
+      } else if (!st.inLink && isAlnumCode(c)) { // word char: extended autolink / email
+        if ((m = tryUrl(s, i, ctx, plain))) {
+          out += m.out;
+          consumed = m.raw.length;
+        }
+      }
+      if (!consumed) {
+        // plain text run
+        const end = scanText(s, i);
+        const raw = s.slice(i, end);
+        if (st.inRaw) out += raw;
+        else if (plain) out += unescapeNum(raw);
+        else out += esc(unescapeNum(raw));
+        const lastCh = raw.charCodeAt(raw.length - 1);
+        if (lastCh !== 95) prevChar = raw.charAt(raw.length - 1); // not '_' -> update
+        consumed = end - i;
+        i += consumed;
+        continue;
       }
       prevChar = '';
       i += consumed;
