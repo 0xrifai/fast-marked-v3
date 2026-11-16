@@ -255,12 +255,18 @@ function maskReflinks(t, refs) {
 function maskInline(s, refs) {
   let t = s;
   if (refs.size > 0 && s.includes('[')) t = maskReflinks(t, refs);
-  t = t.replace(RE_I_ANY_PUNCT_OUT, (m, codeRun, escCh) => {
-    if (escCh !== undefined) return '+'.repeat(m.length);
-    if (codeRun !== undefined) return codeRun + m.slice(codeRun.length, -codeRun.length).replace(/`/g, '+') + codeRun;
-    return m;
-  });
-  t = t.replace(RE_I_BLOCKSKIP, (m) => '[' + 'a'.repeat(m.length - 2) + ']');
+  // The two replaces can only match when these chars are present; skipping
+  // them saves two full-string scans on plain emphasis text.
+  if (t.includes('`') || t.includes('\\')) {
+    t = t.replace(RE_I_ANY_PUNCT_OUT, (m, codeRun, escCh) => {
+      if (escCh !== undefined) return '+'.repeat(m.length);
+      if (codeRun !== undefined) return codeRun + m.slice(codeRun.length, -codeRun.length).replace(/`/g, '+') + codeRun;
+      return m;
+    });
+  }
+  if (t.includes('[') || t.includes('`') || t.includes('<')) {
+    t = t.replace(RE_I_BLOCKSKIP, (m) => '[' + 'a'.repeat(m.length - 2) + ']');
+  }
   return t;
 }
 
@@ -749,21 +755,51 @@ function parseList(e, ctx) {
     }
     if (!u) {
       const at = atRegexes(R);
-      while (rest.length > 0) {
-        const U = rest.split('\n', 1)[0];
+      // Index cursor over rest (no per-line rest.slice: that was O(n^2)).
+      // Break tests are pre-filtered by the line's first non-space char:
+      // the at-* regexes are all ^ {0,n} + a marker, so they can only match
+      // when the first non-space char is one of ` ~ # < > * + - _ or a digit,
+      // and never when a tab precedes it (^ {0,n} allows spaces only).
+      let rp = 0;
+      const dp = [d];
+      while (rp < rest.length) {
+        let nl = rest.indexOf('\n', rp);
+        if (nl === -1) nl = rest.length;
+        const U = rest.slice(rp, nl);
         f = U;
-        const Z = f.replace(RE_LEADING_SPACE_TAB, me => expandTabs(me, 0));
-        if (at.fences.test(f) || at.heading.test(f) || at.html.test(f) || at.bq.test(f) || at.next.test(f) || at.hr.test(f)) break;
-        if (Z.search(RE_NON_SPACE) >= R || !f.trim()) d += '\n' + Z.slice(R);
+        let j = 0, hasTab = false;
+        while (j < U.length) {
+          const c = U.charCodeAt(j);
+          if (c === 32) j++;
+          else if (c === 9) { hasTab = true; j++; }
+          else break;
+        }
+        const firstCh = j < U.length ? U.charCodeAt(j) : -1;
+        let isBreak = false;
+        if (!hasTab && firstCh !== -1) {
+          if (firstCh === 96 || firstCh === 126) isBreak = at.fences.test(U);
+          else if (firstCh === 35) isBreak = at.heading.test(U);
+          else if (firstCh === 60) isBreak = at.html.test(U);
+          else if (firstCh === 62) isBreak = at.bq.test(U);
+          else if (firstCh === 42 || firstCh === 43 || firstCh === 45) isBreak = at.next.test(U) || at.hr.test(U);
+          else if (firstCh === 95) isBreak = at.hr.test(U);
+          else if (firstCh >= 48 && firstCh <= 57) isBreak = at.next.test(U);
+        }
+        if (isBreak) break;
+        const Z = hasTab ? U.replace(RE_LEADING_SPACE_TAB, me => expandTabs(me, 0)) : U;
+        const nonSpace = hasTab ? Z.search(RE_NON_SPACE) : j;
+        if (nonSpace >= R || !U.trim()) dp.push('\n' + Z.slice(R));
         else {
           if (y || m.replace(/\t/g, '    ').search(RE_NON_SPACE) >= 4 || at.fences.test(m) || at.heading.test(m) || at.html.test(m) || at.hr.test(m)) break;
-          const qe = RE_SETEXT_LINE.test(f) && RE_LHEADING.test(m + '\n' + f) ? '    ' + Z.replace(/^ {0,3}/, '') : f;
-          d += '\n' + qe;
+          const qe = RE_SETEXT_LINE.test(U) && RE_LHEADING.test(m + '\n' + U) ? '    ' + Z.replace(/^ {0,3}/, '') : U;
+          dp.push('\n' + qe);
         }
-        y = !f.trim();
-        rest = rest.slice(U.length + 1);
+        y = !U.trim();
+        rp = nl + 1;
         m = Z.slice(R);
       }
+      d = dp.join('');
+      rest = rest.slice(Math.min(rp, rest.length));
     }
     const A = n.slice(k, n.length - rest.length);
     if (!list.loose) {
